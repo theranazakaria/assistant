@@ -20,7 +20,11 @@ function getPool() {
       else if (/supabase\.(com|co)$/.test(u.hostname)) { u.searchParams.delete('sslmode'); o.ssl = { rejectUnauthorized: false }; } // Supabase pooler uses its own CA
       cs = u.toString();
     } catch (e) {}
-    o.connectionString = cs; pool = new Pool(o); pool.on('error', () => {});
+    if (process.env.DB_HOST) { // alternative to DATABASE_URL: separate settings, no URL-encoding problems
+      Object.assign(o, { host: process.env.DB_HOST, port: +process.env.DB_PORT || 6543, user: process.env.DB_USER, password: process.env.DB_PASSWORD, database: process.env.DB_NAME || 'postgres' });
+      o.ssl = process.env.DB_CA ? { ca: process.env.DB_CA.replace(/\\n/g, '\n') } : (/supabase\.(com|co)$/.test(process.env.DB_HOST) ? { rejectUnauthorized: false } : true);
+    } else o.connectionString = cs;
+    pool = new Pool(o); pool.on('error', () => {});
   }
   return pool;
 }
@@ -92,7 +96,7 @@ const USERCOLS = 'id,username,name,role,days,active,designation,subjects,phone,e
 module.exports = async (req, res) => {
   try {
     if (req.method !== 'POST') return send(res, 405, { e: 'Use POST.' });
-    if (!process.env.DATABASE_URL || SEC.length < 16) return send(res, 500, { e: 'Server not configured. Set DATABASE_URL and AUTH_SECRET (16+ characters) in Vercel.' });
+    if ((!process.env.DATABASE_URL && !process.env.DB_HOST) || SEC.length < 16) return send(res, 500, { e: 'Server not configured. Set DATABASE_URL and AUTH_SECRET (16+ characters) in Vercel.' });
     await init();
     const b = req.body || {}, a = b.a;
 
@@ -298,6 +302,10 @@ module.exports = async (req, res) => {
     return send(res, 400, { e: 'Unknown action.' });
   } catch (e) {
     console.error(e);
-    return send(res, 500, { e: 'Server error. Check the Vercel function logs.' });
+    const m = e && e.code === '28P01' ? 'Database login failed: the database user or password in Vercel is wrong.'
+      : e && e.code === 'XX000' ? 'Database rejected the user name. For Supabase it must look like postgres.YOURPROJECTREF.'
+      : e && ['ENOTFOUND', 'ENETUNREACH', 'ETIMEDOUT', 'ECONNREFUSED'].includes(e.code) ? 'Cannot reach the database. For Supabase use the Transaction pooler connection (port 6543).'
+      : 'Server error. Check the Vercel function logs.';
+    return send(res, 500, { e: m });
   }
 };
