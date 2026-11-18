@@ -130,10 +130,19 @@ module.exports = async (req, res) => {
 
     if (a === 'progress') {
       const td = ts().slice(0, 10);
-      const f = (kind, aud) => q(`SELECT u.id,u.name,count(t.id) AS total,count(CASE WHEN t.id IS NOT NULL AND a.status='Done' THEN 1 END) AS done,count(CASE WHEN a.status<>'Done' AND t.due<$1 THEN 1 END) AS late FROM users u LEFT JOIN assign a ON a.user_id=u.id LEFT JOIN tasks t ON t.id=a.task_id AND t.kind=$2 WHERE u.active AND ${aud} GROUP BY u.id,u.name ORDER BY u.name`, [td, kind]);
-      return send(res, 200, { rows: await f('staff', "u.role='staff'"), trows: await f('tutor', "(u.role='tutor' OR u.id IN (SELECT user_id FROM tutors))") });
+      const f = (kind, aud) => q(`SELECT u.id,u.name,count(t.id) AS total,count(CASE WHEN t.id IS NOT NULL AND a.status='Done' THEN 1 END) AS done,count(CASE WHEN a.status<>'Done' AND t.due<$1 THEN 1 END) AS late FROM users u LEFT JOIN assign a ON a.user_id=u.id LEFT JOIN tasks t ON t.id=a.task_id AND (t.kind=$2 OR t.kind='all') WHERE u.active AND ${aud} GROUP BY u.id,u.name ORDER BY u.name`, [td, kind]);
+      const types = await q("SELECT t.type AS name,count(*) AS total,count(CASE WHEN a.status='Done' THEN 1 END) AS done,count(CASE WHEN a.status<>'Done' AND t.due<$1 THEN 1 END) AS late FROM assign a JOIN tasks t ON t.id=a.task_id GROUP BY t.type ORDER BY count(*) DESC LIMIT 8", [td]);
+      const trend = await q("SELECT substr(a.updated,1,10) AS d,count(*) AS n FROM assign a WHERE a.status='Done' AND a.updated IS NOT NULL GROUP BY substr(a.updated,1,10) ORDER BY substr(a.updated,1,10) DESC LIMIT 60");
+      return send(res, 200, { rows: await f('staff', "u.role='staff'"), trows: await f('tutor', "(u.role='tutor' OR u.id IN (SELECT user_id FROM tutors))"), types, trend });
     }
 
+    if (a === 'person') {
+      const id = +b.id, p = (await q("SELECT id,name,role,designation,subjects FROM users WHERE id=$1 AND active AND role IN ('staff','tutor')", [id]))[0];
+      if (!p) return send(res, 404, { e: 'Person not found.' });
+      const rows = await q('SELECT a.status,a.updated,t.title,t.type,t.kind,t.due,t.time,t.pri FROM assign a JOIN tasks t ON t.id=a.task_id WHERE a.user_id=$1 ORDER BY t.due DESC', [id]);
+      const classes = await q('SELECT class_name,year,section FROM tutors WHERE user_id=$1', [id]);
+      return send(res, 200, { p, td: ts().slice(0, 10), classes, rows: ADM ? rows : rows.map(r => ({ status: r.status, updated: r.updated, type: r.type, kind: r.kind, due: r.due })) });
+    }
     if (a === 'users.list') { if (!ADM) return deny(); return send(res, 200, { users: await q(`SELECT ${USERCOLS},created FROM users ORDER BY role DESC,name`) }); }
     if (a === 'users.add') {
       if (!ADM) return deny();
@@ -184,8 +193,8 @@ module.exports = async (req, res) => {
 
     if (a === 'tasks.add') {
       if (!ADM) return deny();
-      const scope = ['single', 'partial', 'all'].includes(b.scope) ? b.scope : 'single', kind = b.kind === 'tutor' ? 'tutor' : 'staff';
-      const aud = kind === 'tutor' ? "(role='tutor' OR id IN (SELECT user_id FROM tutors))" : "role='staff'";
+      const scope = ['single', 'partial', 'all'].includes(b.scope) ? b.scope : 'single', kind = ['tutor', 'all'].includes(b.kind) ? b.kind : 'staff';
+      const aud = kind === 'tutor' ? "(role='tutor' OR id IN (SELECT user_id FROM tutors))" : kind === 'all' ? "role IN ('staff','tutor')" : "role='staff'";
       let ids;
       if (scope === 'all') ids = (await q(`SELECT id FROM users WHERE active AND ${aud}`)).map(x => x.id);
       else { ids = (await q(`SELECT id FROM users WHERE active AND ${aud} AND id=ANY($1::int[])`, [(Array.isArray(b.ids) ? b.ids : []).map(Number)])).map(x => x.id); if (scope === 'single') ids = ids.slice(0, 1); }
