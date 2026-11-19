@@ -4,10 +4,10 @@ const c = require('crypto');
 types.setTypeParser(20, v => Number(v)); // int8 -> number (CockroachDB integers are int8)
 const SEC = process.env.AUTH_SECRET || '';
 const ST = ['Pending', 'In progress', 'Done'];
-const SCHEMA = 'v5';
+const SCHEMA = 'v6';
 const NOW = '__TS__';
 const AUTO = { users: 'created', tasks: 'created', assign: 'updated', leaves: 'created', misconduct: 'created', tutors: 'created', tt: 'created', notes: 'created', audit: 'at' };
-const MUT = { 'users.add': 'Account created', 'users.set': 'Account changed', 'users.edit': 'Staff details edited', 'users.del': 'Account deleted', 'tasks.add': 'Task assigned', 'task.set': 'Task status updated', 'task.del': 'Task deleted', 'leave.apply': 'Leave recorded', 'leave.decide': 'Leave decision', 'mis.add': 'Misconduct report filed', 'mis.del': 'Misconduct report deleted', 'tutors.save': 'Tutor assignment saved', 'tutors.del': 'Tutor assignment removed', 'tt.save': 'Timetable entry saved', 'tt.del': 'Timetable entry removed', 'notes.add': 'Note added' };
+const MUT = { 'users.add': 'Account created', 'users.set': 'Account changed', 'users.edit': 'Staff details edited', 'users.del': 'Account deleted', 'tasks.add': 'Task assigned', 'task.set': 'Task status updated', 'task.del': 'Task deleted', 'leave.apply': 'Leave recorded', 'leave.decide': 'Leave decision', 'mis.add': 'Misconduct report filed', 'mis.del': 'Misconduct report deleted', 'tutors.save': 'Tutor assignment saved', 'tutors.del': 'Tutor assignment removed', 'tt.save': 'Timetable entry saved', 'tt.del': 'Timetable entry removed', 'notes.add': 'Note added', 'task.grade': 'Task marked' };
 let pool = null, ready;
 
 function getPool() {
@@ -56,6 +56,9 @@ async function ddl() {
   for (const col of ["designation text DEFAULT ''", "subjects text DEFAULT ''", "phone text DEFAULT ''", "email text DEFAULT ''", 'updated text', 'updated_by text']) await q(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ${col}`);
   await q("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS kind text DEFAULT 'staff'");
   await q('ALTER TABLE tt ADD COLUMN IF NOT EXISTS shift text');
+  await q('ALTER TABLE tasks ADD COLUMN IF NOT EXISTS marks int DEFAULT 0');
+  await q('ALTER TABLE assign ADD COLUMN IF NOT EXISTS score int');
+  await q('ALTER TABLE assign ADD COLUMN IF NOT EXISTS scored text');
   await q("INSERT INTO meta(k,v) VALUES('schema',$1) ON CONFLICT (k) DO UPDATE SET v=$1", [SCHEMA]);
 }
 async function schemaOk() {
@@ -91,6 +94,8 @@ const setTok = (res, v, age) => res.setHeader('Set-Cookie', `tok=${v}; HttpOnly;
 const S = v => String(v == null ? '' : v).trim().slice(0, 600);
 const D = v => /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : '';
 const LOW = r => r === 'staff' || r === 'tutor';
+const PHONE = /^[0-9+\-\s()]{7,20}$/, EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+const bad = b => { if (b.name !== undefined && (S(b.name).length < 2 || S(b.name).length > 60)) return 'Name must be 2 to 60 characters.'; if (S(b.phone) && !PHONE.test(S(b.phone))) return 'Phone number is not valid.'; if (S(b.email) && !EMAIL.test(S(b.email))) return 'Email address is not valid.'; return ''; };
 const USERCOLS = 'id,username,name,role,days,active,designation,subjects,phone,email,updated,updated_by';
 
 module.exports = async (req, res) => {
@@ -130,18 +135,19 @@ module.exports = async (req, res) => {
 
     if (a === 'progress') {
       const td = ts().slice(0, 10);
-      const f = (kind, aud) => q(`SELECT u.id,u.name,count(t.id) AS total,count(CASE WHEN t.id IS NOT NULL AND a.status='Done' THEN 1 END) AS done,count(CASE WHEN a.status<>'Done' AND t.due<$1 THEN 1 END) AS late FROM users u LEFT JOIN assign a ON a.user_id=u.id LEFT JOIN tasks t ON t.id=a.task_id AND (t.kind=$2 OR t.kind='all') WHERE u.active AND ${aud} GROUP BY u.id,u.name ORDER BY u.name`, [td, kind]);
+      const f = (kind, aud) => q(`SELECT u.id,u.name,count(t.id) AS total,count(CASE WHEN t.id IS NOT NULL AND a.status='Done' THEN 1 END) AS done,count(CASE WHEN a.status<>'Done' AND t.due<$1 THEN 1 END) AS late,CAST(coalesce(sum(CASE WHEN a.score IS NOT NULL AND t.marks>0 THEN a.score END),0) AS INT) AS got,CAST(coalesce(sum(CASE WHEN a.score IS NOT NULL AND t.marks>0 THEN t.marks END),0) AS INT) AS mx,count(CASE WHEN a.score IS NOT NULL AND t.marks>0 THEN 1 END) AS gr FROM users u LEFT JOIN assign a ON a.user_id=u.id LEFT JOIN tasks t ON t.id=a.task_id AND (t.kind=$2 OR t.kind='all') WHERE u.active AND ${aud} GROUP BY u.id,u.name ORDER BY u.name`, [td, kind]);
       const types = await q("SELECT t.type AS name,count(*) AS total,count(CASE WHEN a.status='Done' THEN 1 END) AS done,count(CASE WHEN a.status<>'Done' AND t.due<$1 THEN 1 END) AS late FROM assign a JOIN tasks t ON t.id=a.task_id GROUP BY t.type ORDER BY count(*) DESC LIMIT 8", [td]);
       const trend = await q("SELECT substr(a.updated,1,10) AS d,count(*) AS n FROM assign a WHERE a.status='Done' AND a.updated IS NOT NULL GROUP BY substr(a.updated,1,10) ORDER BY substr(a.updated,1,10) DESC LIMIT 60");
-      return send(res, 200, { rows: await f('staff', "u.role='staff'"), trows: await f('tutor', "(u.role='tutor' OR u.id IN (SELECT user_id FROM tutors))"), types, trend });
+      const mask = r => (ADM || r.id === u.id) ? r : { ...r, got: 0, mx: 0, gr: 0 };
+      return send(res, 200, { rows: (await f('staff', "u.role='staff'")).map(mask), trows: (await f('tutor', "(u.role='tutor' OR u.id IN (SELECT user_id FROM tutors))")).map(mask), types, trend });
     }
 
     if (a === 'person') {
       const id = +b.id, p = (await q("SELECT id,name,role,designation,subjects FROM users WHERE id=$1 AND active AND role IN ('staff','tutor')", [id]))[0];
       if (!p) return send(res, 404, { e: 'Person not found.' });
-      const rows = await q('SELECT a.status,a.updated,t.title,t.type,t.kind,t.due,t.time,t.pri FROM assign a JOIN tasks t ON t.id=a.task_id WHERE a.user_id=$1 ORDER BY t.due DESC', [id]);
+      const rows = await q('SELECT a.status,a.updated,a.score,t.marks,t.title,t.type,t.kind,t.due,t.time,t.pri FROM assign a JOIN tasks t ON t.id=a.task_id WHERE a.user_id=$1 ORDER BY t.due DESC', [id]);
       const classes = await q('SELECT class_name,year,section FROM tutors WHERE user_id=$1', [id]);
-      return send(res, 200, { p, td: ts().slice(0, 10), classes, rows: ADM ? rows : rows.map(r => ({ status: r.status, updated: r.updated, type: r.type, kind: r.kind, due: r.due })) });
+      return send(res, 200, { p, td: ts().slice(0, 10), classes, rows: ADM || id === u.id ? rows : rows.map(r => ({ status: r.status, updated: r.updated, type: r.type, kind: r.kind, due: r.due })) });
     }
     if (a === 'users.list') { if (!ADM) return deny(); return send(res, 200, { users: await q(`SELECT ${USERCOLS},created FROM users ORDER BY role DESC,name`) }); }
     if (a === 'users.add') {
@@ -150,6 +156,7 @@ module.exports = async (req, res) => {
       if (!LOW(role) && !SUP) return deny();
       const un = S(b.username).toLowerCase(), nm = S(b.name), pw = String(b.password || '');
       if (!/^[a-z0-9._-]{3,30}$/.test(un) || !nm || pw.length < 6) return send(res, 400, { e: 'Username (3-30 letters/numbers), name and a password of 6+ characters are required.' });
+      if (bad(b)) return send(res, 400, { e: bad(b) });
       const days = (Array.isArray(b.days) ? b.days : [1, 2, 3, 4, 5]).filter(x => x >= 0 && x <= 6).join(',');
       try { await q(`INSERT INTO users(username,name,role,pass,days,designation,subjects,phone,email,updated,updated_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,${NOW},$10)`, [un, nm, role, hash(pw), days, S(b.designation), S(b.subjects), S(b.phone).slice(0, 30), S(b.email).slice(0, 100), u.name]); }
       catch (e) { return send(res, 400, { e: 'That username already exists.' }); }
@@ -159,6 +166,7 @@ module.exports = async (req, res) => {
       const id = +b.id, r = (await q('SELECT role,username,name FROM users WHERE id=$1', [id]))[0];
       if (!r) return send(res, 404, { e: 'User not found.' });
       const own = id === u.id;
+      if (a === 'users.edit' && bad({ phone: b.phone, email: b.email })) return send(res, 400, { e: bad({ phone: b.phone, email: b.email }) });
       if (a === 'users.edit' && !ADM && own) {
         await q(`UPDATE users SET phone=$1,email=$2,updated=${NOW},updated_by=$3 WHERE id=$4`, [S(b.phone).slice(0, 30), S(b.email).slice(0, 100), u.name, id]);
         return send(res, 200, { ok: 1 });
@@ -175,7 +183,7 @@ module.exports = async (req, res) => {
         return send(res, 200, { ok: 1 });
       }
       if (a === 'users.edit') {
-        if (!S(b.name)) return send(res, 400, { e: 'Name is required.' });
+        if (bad(b) || !S(b.name)) return send(res, 400, { e: bad(b) || 'Name is required.' });
         const un = b.username ? S(b.username).toLowerCase() : null;
         if (un && !/^[a-z0-9._-]{3,30}$/.test(un)) return send(res, 400, { e: 'Username must be 3-30 letters, numbers, dot, dash or underscore.' });
         try {
@@ -198,8 +206,10 @@ module.exports = async (req, res) => {
       let ids;
       if (scope === 'all') ids = (await q(`SELECT id FROM users WHERE active AND ${aud}`)).map(x => x.id);
       else { ids = (await q(`SELECT id FROM users WHERE active AND ${aud} AND id=ANY($1::int[])`, [(Array.isArray(b.ids) ? b.ids : []).map(Number)])).map(x => x.id); if (scope === 'single') ids = ids.slice(0, 1); }
-      if (!S(b.title) || !S(b.type) || !D(b.due) || !ids.length) return send(res, 400, { e: 'Title, duty type, deadline and at least one person are required.' });
-      const tk = await q('INSERT INTO tasks(title,type,due,time,pri,scope,kind,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id', [S(b.title), S(b.type), b.due, S(b.time), ['High', 'Medium', 'Low'].includes(b.pri) ? b.pri : 'Medium', scope, kind, u.id]);
+      if (S(b.title).length < 3 || S(b.title).length > 120) return send(res, 400, { e: 'Title must be 3 to 120 characters.' });
+      const marks = Math.max(0, Math.min(1000, parseInt(b.marks, 10) || 0));
+      if (!S(b.type) || !D(b.due) || !ids.length) return send(res, 400, { e: 'Title, duty type, deadline and at least one person are required.' });
+      const tk = await q('INSERT INTO tasks(title,type,due,time,pri,scope,kind,marks,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id', [S(b.title), S(b.type), b.due, S(b.time), ['High', 'Medium', 'Low'].includes(b.pri) ? b.pri : 'Medium', scope, kind, marks, u.id]);
       for (const i of ids) {
         const as = await q('INSERT INTO assign(task_id,user_id) VALUES($1,$2) RETURNING id', [tk[0].id, i]);
         if (S(b.note)) await q('INSERT INTO notes(ref,ref_id,user_id,body) VALUES($1,$2,$3,$4)', ['task', as[0].id, u.id, S(b.note)]);
@@ -207,7 +217,7 @@ module.exports = async (req, res) => {
       return send(res, 200, { ok: 1, count: ids.length });
     }
     if (a === 'tasks.list') {
-      const sel = "SELECT a.id,a.task_id,a.user_id,u.name,a.status,a.note,(a.image IS NOT NULL) AS img,a.updated,(SELECT count(*) FROM notes n WHERE n.ref='task' AND n.ref_id=a.id) AS nn,(SELECT w.name || ': ' || n.body FROM notes n JOIN users w ON w.id=n.user_id WHERE n.ref='task' AND n.ref_id=a.id ORDER BY n.id DESC LIMIT 1) AS lastn FROM assign a JOIN users u ON u.id=a.user_id";
+      const sel = "SELECT a.id,a.task_id,a.user_id,u.name,a.status,a.note,(a.image IS NOT NULL) AS img,a.updated,a.score,(SELECT count(*) FROM notes n WHERE n.ref='task' AND n.ref_id=a.id) AS nn,(SELECT w.name || ': ' || n.body FROM notes n JOIN users w ON w.id=n.user_id WHERE n.ref='task' AND n.ref_id=a.id ORDER BY n.id DESC LIMIT 1) AS lastn FROM assign a JOIN users u ON u.id=a.user_id";
       if (ADM) return send(res, 200, { tasks: await q('SELECT * FROM tasks ORDER BY due,id'), as: await q(sel + ' ORDER BY a.id') });
       return send(res, 200, { tasks: await q('SELECT * FROM tasks WHERE id IN (SELECT task_id FROM assign WHERE user_id=$1) ORDER BY due,id', [u.id]), as: await q(sel + ' WHERE a.user_id=$1 ORDER BY a.id', [u.id]) });
     }
@@ -221,6 +231,17 @@ module.exports = async (req, res) => {
         await q(`UPDATE assign SET status=$1,note=$2,image=$3,updated=${NOW} WHERE id=$4`, [b.status, S(b.note), b.image, +b.id]);
       } else if (b.image === '') await q(`UPDATE assign SET status=$1,note=$2,image=NULL,updated=${NOW} WHERE id=$3`, [b.status, S(b.note), +b.id]);
       else await q(`UPDATE assign SET status=$1,note=$2,updated=${NOW} WHERE id=$3`, [b.status, S(b.note), +b.id]);
+      return send(res, 200, { ok: 1 });
+    }
+    if (a === 'task.grade') {
+      if (!ADM) return deny();
+      const r = (await q('SELECT a.id,t.marks FROM assign a JOIN tasks t ON t.id=a.task_id WHERE a.id=$1', [+b.id]))[0];
+      if (!r) return send(res, 404, { e: 'Task not found.' });
+      if (!(r.marks > 0)) return send(res, 400, { e: 'This task has no marks set.' });
+      if (b.score === '' || b.score == null) return send(res, 400, { e: 'Enter the marks first.' });
+      const sc = Number(b.score);
+      if (!Number.isInteger(sc) || sc < 0 || sc > r.marks) return send(res, 400, { e: 'Marks must be a whole number from 0 to ' + r.marks + '.' });
+      await q(`UPDATE assign SET score=$1,scored=${NOW} WHERE id=$2`, [sc, +b.id]);
       return send(res, 200, { ok: 1 });
     }
     if (a === 'task.img') {
@@ -238,6 +259,7 @@ module.exports = async (req, res) => {
     if (a === 'leave.apply') {
       const uid = ADM && b.uid ? +b.uid : u.id;
       if (!D(b.from) || !D(b.to) || b.to < b.from) return send(res, 400, { e: 'Enter valid from and to dates.' });
+      if (S(b.reason).length < 5) return send(res, 400, { e: 'Please enter a reason (at least 5 characters).' });
       await q('INSERT INTO leaves(user_id,from_d,to_d,type,reason,status,decided_by) VALUES($1,$2,$3,$4,$5,$6,$7)', [uid, b.from, b.to, S(b.type) || 'Casual', S(b.reason), ADM && b.uid ? 'Approved' : 'Pending', ADM && b.uid ? u.id : null]);
       return send(res, 200, { ok: 1 });
     }
@@ -253,7 +275,7 @@ module.exports = async (req, res) => {
 
     if (a === 'mis.add') {
       if (!ADM) return deny();
-      if (!+b.uid || !D(b.date) || !S(b.descr)) return send(res, 400, { e: 'Staff member, date and description are required.' });
+      if (!+b.uid || !D(b.date) || S(b.descr).length < 10) return send(res, 400, { e: 'Staff member, date and a description of at least 10 characters are required.' });
       await q('INSERT INTO misconduct(user_id,date,category,descr,action,reported_by) VALUES($1,$2,$3,$4,$5,$6)', [+b.uid, b.date, S(b.category), S(b.descr), S(b.action), u.id]);
       return send(res, 200, { ok: 1 });
     }
@@ -285,7 +307,7 @@ module.exports = async (req, res) => {
     if (a === 'tt.save') {
       if (!ADM) return deny();
       const uid = +b.uid, day = +b.day, f = S(b.t_from), t2 = S(b.t_to), id = +b.id || 0, sh = b.shift === 'evening' ? 'evening' : 'morning', re = /^([01]\d|2[0-3]):[0-5]\d$/;
-      if (!uid || !(day >= 0 && day <= 6) || !re.test(f) || !re.test(t2) || t2 <= f || !S(b.subject)) return send(res, 400, { e: 'Teacher, day, periods and subject are required.' });
+      if (!uid || !(day >= 0 && day <= 6) || !re.test(f) || !re.test(t2) || t2 <= f || S(b.subject).length < 2) return send(res, 400, { e: 'Teacher, day, periods and subject are required.' });
       if ((await q('SELECT 1 AS x FROM tt WHERE user_id=$1 AND day=$2 AND t_from<$4 AND t_to>$3 AND id<>$5', [uid, day, f, t2, id])).length) return send(res, 400, { e: 'This teacher already has a class in that time slot.' });
       if (S(b.room) && (await q('SELECT 1 AS x FROM tt WHERE lower(room)=lower($1) AND day=$2 AND t_from<$4 AND t_to>$3 AND id<>$5', [S(b.room), day, f, t2, id])).length) return send(res, 400, { e: 'That room is already used in that time slot.' });
       const v = [uid, day, f, t2, S(b.subject), S(b.class_name), S(b.room), sh, u.name];
