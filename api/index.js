@@ -4,10 +4,10 @@ const c = require('crypto');
 types.setTypeParser(20, v => Number(v)); // int8 -> number (CockroachDB integers are int8)
 const SEC = process.env.AUTH_SECRET || '';
 const ST = ['Pending', 'In progress', 'Done'];
-const SCHEMA = 'v6';
+const SCHEMA = 'v7';
 const NOW = '__TS__';
-const AUTO = { users: 'created', tasks: 'created', assign: 'updated', leaves: 'created', misconduct: 'created', tutors: 'created', tt: 'created', notes: 'created', audit: 'at' };
-const MUT = { 'users.add': 'Account created', 'users.set': 'Account changed', 'users.edit': 'Staff details edited', 'users.del': 'Account deleted', 'tasks.add': 'Task assigned', 'task.set': 'Task status updated', 'task.del': 'Task deleted', 'leave.apply': 'Leave recorded', 'leave.decide': 'Leave decision', 'mis.add': 'Misconduct report filed', 'mis.del': 'Misconduct report deleted', 'tutors.save': 'Tutor assignment saved', 'tutors.del': 'Tutor assignment removed', 'tt.save': 'Timetable entry saved', 'tt.del': 'Timetable entry removed', 'notes.add': 'Note added', 'task.grade': 'Task marked' };
+const AUTO = { users: 'created', tasks: 'created', assign: 'updated', leaves: 'created', misconduct: 'created', tutors: 'created', tt: 'created', notes: 'created', audit: 'at', notifs: 'created' };
+const MUT = { 'users.add': 'Account created', 'users.set': 'Account changed', 'users.edit': 'Staff details edited', 'users.del': 'Account deleted', 'tasks.add': 'Task assigned', 'task.set': 'Task status updated', 'task.del': 'Task deleted', 'leave.apply': 'Leave recorded', 'leave.decide': 'Leave decision', 'mis.add': 'Misconduct report filed', 'mis.del': 'Misconduct report deleted', 'tutors.save': 'Tutor assignment saved', 'tutors.del': 'Tutor assignment removed', 'tt.save': 'Timetable entry saved', 'tt.del': 'Timetable entry removed', 'notes.add': 'Note added', 'task.grade': 'Task marked', announce: 'Announcement sent', 'pass.change': 'Password changed' };
 let pool = null, ready;
 
 function getPool() {
@@ -48,11 +48,12 @@ async function ddl() {
     `CREATE TABLE IF NOT EXISTS tt(id ${ID}, user_id int NOT NULL, day int, t_from text, t_to text, subject text, class_name text, room text, created text, updated text, updated_by text)`,
     `CREATE TABLE IF NOT EXISTS notes(id ${ID}, ref text, ref_id int, user_id int, body text, created text)`,
     `CREATE TABLE IF NOT EXISTS audit(id ${ID}, at text, user_id int, name text, action text, detail text)`,
+    `CREATE TABLE IF NOT EXISTS notifs(id ${ID}, user_id int NOT NULL, kind text, title text, body text, tab text, ref int, is_read boolean DEFAULT false, created text)`,
     'CREATE TABLE IF NOT EXISTS login_fail(k text PRIMARY KEY, n int, t bigint)',
     'CREATE TABLE IF NOT EXISTS meta(k text PRIMARY KEY, v text)'
   ];
   for (const t of T) await q(t);
-  for (const tb of ['users', 'tasks', 'assign', 'leaves', 'misconduct', 'tutors', 'tt', 'notes', 'audit', 'login_fail', 'meta']) { try { await q(`ALTER TABLE ${tb} ENABLE ROW LEVEL SECURITY`); } catch (e) {} } // blocks Supabase public API access
+  for (const tb of ['users', 'tasks', 'assign', 'leaves', 'misconduct', 'tutors', 'tt', 'notes', 'audit', 'notifs', 'login_fail', 'meta']) { try { await q(`ALTER TABLE ${tb} ENABLE ROW LEVEL SECURITY`); } catch (e) {} } // blocks Supabase public API access
   for (const col of ["designation text DEFAULT ''", "subjects text DEFAULT ''", "phone text DEFAULT ''", "email text DEFAULT ''", 'updated text', 'updated_by text']) await q(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ${col}`);
   await q("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS kind text DEFAULT 'staff'");
   await q('ALTER TABLE tt ADD COLUMN IF NOT EXISTS shift text');
@@ -98,6 +99,23 @@ const PHONE = /^[0-9+\-\s()]{7,20}$/, EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 const bad = b => { if (b.name !== undefined && (S(b.name).length < 2 || S(b.name).length > 60)) return 'Name must be 2 to 60 characters.'; if (S(b.phone) && !PHONE.test(S(b.phone))) return 'Phone number is not valid.'; if (S(b.email) && !EMAIL.test(S(b.email))) return 'Email address is not valid.'; return ''; };
 const USERCOLS = 'id,username,name,role,days,active,designation,subjects,phone,email,updated,updated_by';
 
+
+async function notify(ids, kind, title, body, tab, ref) {
+  for (const id of [...new Set(ids)]) {
+    try { await q('INSERT INTO notifs(user_id,kind,title,body,tab,ref) VALUES($1,$2,$3,$4,$5,$6)', [id, kind, String(title).slice(0, 120), String(body || '').slice(0, 300), tab || '', ref || 0]); } catch (e) { console.error(e); }
+  }
+}
+const adminIds = async () => (await q("SELECT id FROM users WHERE active AND role IN ('admin','superadmin')")).map(x => x.id);
+const addDays = (d, n) => { const t = new Date(d + 'T00:00:00Z'); t.setUTCDate(t.getUTCDate() + n); return t.toISOString().slice(0, 10); };
+async function reminders(u, adm) {
+  const td = ts().slice(0, 10), out = [];
+  const rows = await q("SELECT a.id,t.title,t.due FROM assign a JOIN tasks t ON t.id=a.task_id WHERE a.user_id=$1 AND a.status<>'Done' AND t.due<=$2 ORDER BY t.due LIMIT 20", [u.id, addDays(td, 2)]);
+  rows.forEach(r => out.push({ id: 'r' + r.id, kind: 'reminder', title: (r.due < td ? 'Overdue: ' : r.due === td ? 'Due today: ' : 'Due soon: ') + r.title, body: 'Deadline ' + r.due, tab: 'mine', is_read: false }));
+  if (adm) { const o = (await q("SELECT count(*) AS n FROM assign a JOIN tasks t ON t.id=a.task_id WHERE a.status<>'Done' AND t.due<$1", [td]))[0].n; if (o > 0) out.unshift({ id: 'ov', kind: 'reminder', title: o + ' overdue task' + (o === 1 ? '' : 's') + ' in the department', body: 'Open the Tasks page to follow up', tab: 'tasks', is_read: false }); }
+  return out;
+}
+const unreadCount = async u => (await q('SELECT count(*) AS n FROM notifs WHERE user_id=$1 AND NOT is_read', [u.id]))[0].n;
+
 module.exports = async (req, res) => {
   try {
     if (req.method !== 'POST') return send(res, 405, { e: 'Use POST.' });
@@ -128,10 +146,33 @@ module.exports = async (req, res) => {
     const ADM = u.role === 'admin' || u.role === 'superadmin', SUP = u.role === 'superadmin';
     const deny = () => send(res, 403, { e: 'Not allowed for your role.' });
     res._a = a; res._u = u;
-    res._d = Object.entries(b).filter(([k]) => !['a', 'pass', 'password', 'image', 'text', 'descr', 'note', 'action'].includes(k)).map(([k, v]) => k + '=' + String(Array.isArray(v) ? v.join(',') : v).slice(0, 40)).join(', ').slice(0, 200);
+    res._d = Object.entries(b).filter(([k]) => !['a', 'pass', 'password', 'image', 'text', 'descr', 'note', 'action', 'cur', 'nw', 'body'].includes(k)).map(([k, v]) => k + '=' + String(Array.isArray(v) ? v.join(',') : v).slice(0, 40)).join(', ').slice(0, 200);
 
     if (a === 'me') return send(res, 200, { me: u });
-    if (a === 'ping') return send(res, 200, { v: (await q('SELECT coalesce(max(id),0) AS v FROM audit'))[0].v });
+    if (a === 'ping') return send(res, 200, { v: (await q('SELECT coalesce(max(id),0) AS v FROM audit'))[0].v, n: (await unreadCount(u)) + (await reminders(u, ADM)).length });
+    if (a === 'notifs.list') return send(res, 200, { items: await q('SELECT id,kind,title,body,tab,is_read,created FROM notifs WHERE user_id=$1 ORDER BY id DESC LIMIT 40', [u.id]), reminders: await reminders(u, ADM), unread: await unreadCount(u) });
+    if (a === 'notifs.read') {
+      if (b.all) await q('UPDATE notifs SET is_read=true WHERE user_id=$1', [u.id]);
+      else await q('UPDATE notifs SET is_read=true WHERE user_id=$1 AND id=ANY($2::int[])', [u.id, (Array.isArray(b.ids) ? b.ids : []).map(Number)]);
+      return send(res, 200, { ok: 1 });
+    }
+    if (a === 'announce') {
+      if (!ADM) return deny();
+      const ti = S(b.title), bo = S(b.body);
+      if (ti.length < 3 || ti.length > 80 || bo.length < 3 || bo.length > 500) return send(res, 400, { e: 'Title (3-80) and message (3-500 characters) are required.' });
+      const roles = b.audience === 'staff' ? "('staff')" : b.audience === 'tutor' ? "('tutor')" : "('staff','tutor')";
+      const ids = (await q(`SELECT id FROM users WHERE active AND role IN ${roles}`)).map(x => x.id);
+      await notify(ids, 'announce', ti, bo, 'team');
+      return send(res, 200, { ok: 1, count: ids.length });
+    }
+    if (a === 'pass.change') {
+      const nw = String(b.nw || '');
+      if (nw.length < 6 || nw.length > 100) return send(res, 400, { e: 'New password must be 6 to 100 characters.' });
+      const r = (await q('SELECT pass FROM users WHERE id=$1', [u.id]))[0];
+      if (!r || !check(String(b.cur || ''), r.pass)) return send(res, 400, { e: 'Current password is wrong.' });
+      await q(`UPDATE users SET pass=$1,updated=${NOW},updated_by=$2 WHERE id=$3`, [hash(nw), u.name, u.id]);
+      return send(res, 200, { ok: 1 });
+    }
 
     if (a === 'progress') {
       const td = ts().slice(0, 10);
@@ -167,7 +208,7 @@ module.exports = async (req, res) => {
       if (!r) return send(res, 404, { e: 'User not found.' });
       const own = id === u.id;
       if (a === 'users.edit' && bad({ phone: b.phone, email: b.email })) return send(res, 400, { e: bad({ phone: b.phone, email: b.email }) });
-      if (a === 'users.edit' && !ADM && own) {
+      if (a === 'users.edit' && own && b.name === undefined) {
         await q(`UPDATE users SET phone=$1,email=$2,updated=${NOW},updated_by=$3 WHERE id=$4`, [S(b.phone).slice(0, 30), S(b.email).slice(0, 100), u.name, id]);
         return send(res, 200, { ok: 1 });
       }
@@ -209,20 +250,27 @@ module.exports = async (req, res) => {
       if (S(b.title).length < 3 || S(b.title).length > 120) return send(res, 400, { e: 'Title must be 3 to 120 characters.' });
       const marks = Math.max(0, Math.min(1000, parseInt(b.marks, 10) || 0));
       if (!S(b.type) || !D(b.due) || !ids.length) return send(res, 400, { e: 'Title, duty type, deadline and at least one person are required.' });
-      const tk = await q('INSERT INTO tasks(title,type,due,time,pri,scope,kind,marks,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id', [S(b.title), S(b.type), b.due, S(b.time), ['High', 'Medium', 'Low'].includes(b.pri) ? b.pri : 'Medium', scope, kind, marks, u.id]);
-      for (const i of ids) {
-        const as = await q('INSERT INTO assign(task_id,user_id) VALUES($1,$2) RETURNING id', [tk[0].id, i]);
-        if (S(b.note)) await q('INSERT INTO notes(ref,ref_id,user_id,body) VALUES($1,$2,$3,$4)', ['task', as[0].id, u.id, S(b.note)]);
+      const reps = Math.max(1, Math.min(12, parseInt(b.repeat, 10) || 1)), made = [], pri = ['High', 'Medium', 'Low'].includes(b.pri) ? b.pri : 'Medium';
+      for (let r = 0; r < reps; r++) {
+        const due = r ? addDays(b.due, 7 * r) : b.due, title = reps > 1 ? S(b.title) + ' (week ' + (r + 1) + ')' : S(b.title);
+        const tk = await q('INSERT INTO tasks(title,type,due,time,pri,scope,kind,marks,created_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id', [title, S(b.type), due, S(b.time), pri, scope, kind, marks, u.id]);
+        made.push(tk[0].id);
+        for (const i of ids) {
+          const as = await q('INSERT INTO assign(task_id,user_id) VALUES($1,$2) RETURNING id', [tk[0].id, i]);
+          if (S(b.note)) await q('INSERT INTO notes(ref,ref_id,user_id,body) VALUES($1,$2,$3,$4)', ['task', as[0].id, u.id, S(b.note)]);
+          if (r === 0) await notify([i], 'task', 'New task: ' + S(b.title), 'Deadline ' + b.due + (reps > 1 ? ' · repeats weekly for ' + reps + ' weeks' : '') + (marks ? ' · ' + marks + ' marks' : ''), 'mine', as[0].id);
+        }
       }
-      return send(res, 200, { ok: 1, count: ids.length });
+      return send(res, 200, { ok: 1, count: ids.length, tasks: made });
     }
+
     if (a === 'tasks.list') {
       const sel = "SELECT a.id,a.task_id,a.user_id,u.name,a.status,a.note,(a.image IS NOT NULL) AS img,a.updated,a.score,(SELECT count(*) FROM notes n WHERE n.ref='task' AND n.ref_id=a.id) AS nn,(SELECT w.name || ': ' || n.body FROM notes n JOIN users w ON w.id=n.user_id WHERE n.ref='task' AND n.ref_id=a.id ORDER BY n.id DESC LIMIT 1) AS lastn FROM assign a JOIN users u ON u.id=a.user_id";
       if (ADM) return send(res, 200, { tasks: await q('SELECT * FROM tasks ORDER BY due,id'), as: await q(sel + ' ORDER BY a.id') });
       return send(res, 200, { tasks: await q('SELECT * FROM tasks WHERE id IN (SELECT task_id FROM assign WHERE user_id=$1) ORDER BY due,id', [u.id]), as: await q(sel + ' WHERE a.user_id=$1 ORDER BY a.id', [u.id]) });
     }
     if (a === 'task.set') {
-      const r = (await q('SELECT user_id FROM assign WHERE id=$1', [+b.id]))[0];
+      const r = (await q('SELECT user_id,status FROM assign WHERE id=$1', [+b.id]))[0];
       if (!r) return send(res, 404, { e: 'Task not found.' });
       if (!ADM && r.user_id !== u.id) return deny();
       if (!ST.includes(b.status)) return send(res, 400, { e: 'Invalid status.' });
@@ -231,6 +279,10 @@ module.exports = async (req, res) => {
         await q(`UPDATE assign SET status=$1,note=$2,image=$3,updated=${NOW} WHERE id=$4`, [b.status, S(b.note), b.image, +b.id]);
       } else if (b.image === '') await q(`UPDATE assign SET status=$1,note=$2,image=NULL,updated=${NOW} WHERE id=$3`, [b.status, S(b.note), +b.id]);
       else await q(`UPDATE assign SET status=$1,note=$2,updated=${NOW} WHERE id=$3`, [b.status, S(b.note), +b.id]);
+      if (!ADM && r.status !== b.status) {
+        const tt = (await q('SELECT t.title,t.created_by FROM assign a JOIN tasks t ON t.id=a.task_id WHERE a.id=$1', [+b.id]))[0];
+        if (tt && tt.created_by) await notify([tt.created_by], 'status', u.name + ' set "' + tt.title + '" to ' + b.status, S(b.note), 'tasks', +b.id);
+      }
       return send(res, 200, { ok: 1 });
     }
     if (a === 'task.grade') {
@@ -242,6 +294,8 @@ module.exports = async (req, res) => {
       const sc = Number(b.score);
       if (!Number.isInteger(sc) || sc < 0 || sc > r.marks) return send(res, 400, { e: 'Marks must be a whole number from 0 to ' + r.marks + '.' });
       await q(`UPDATE assign SET score=$1,scored=${NOW} WHERE id=$2`, [sc, +b.id]);
+      const gt = (await q('SELECT a.user_id,t.title FROM assign a JOIN tasks t ON t.id=a.task_id WHERE a.id=$1', [+b.id]))[0];
+      if (gt) await notify([gt.user_id], 'grade', 'Task marked: ' + gt.title, sc + ' out of ' + r.marks + ' marks', 'mine', +b.id);
       return send(res, 200, { ok: 1 });
     }
     if (a === 'task.img') {
@@ -261,6 +315,8 @@ module.exports = async (req, res) => {
       if (!D(b.from) || !D(b.to) || b.to < b.from) return send(res, 400, { e: 'Enter valid from and to dates.' });
       if (S(b.reason).length < 5) return send(res, 400, { e: 'Please enter a reason (at least 5 characters).' });
       await q('INSERT INTO leaves(user_id,from_d,to_d,type,reason,status,decided_by) VALUES($1,$2,$3,$4,$5,$6,$7)', [uid, b.from, b.to, S(b.type) || 'Casual', S(b.reason), ADM && b.uid ? 'Approved' : 'Pending', ADM && b.uid ? u.id : null]);
+      if (ADM && b.uid) await notify([uid], 'leave', 'Leave recorded for you', b.from + ' to ' + b.to, 'leave');
+      else await notify(await adminIds(), 'leave', 'Leave request from ' + u.name, b.from + ' to ' + b.to + ' · ' + S(b.reason).slice(0, 80), 'leave');
       return send(res, 200, { ok: 1 });
     }
     if (a === 'leave.list') {
@@ -270,6 +326,8 @@ module.exports = async (req, res) => {
     if (a === 'leave.decide') {
       if (!ADM || !['Approved', 'Rejected'].includes(b.status)) return deny();
       await q('UPDATE leaves SET status=$1,decided_by=$2 WHERE id=$3', [b.status, u.id, +b.id]);
+      const lv = (await q('SELECT user_id,from_d,to_d FROM leaves WHERE id=$1', [+b.id]))[0];
+      if (lv) await notify([lv.user_id], 'leave', 'Your leave was ' + b.status.toLowerCase(), lv.from_d + ' to ' + lv.to_d, 'leave');
       return send(res, 200, { ok: 1 });
     }
 
@@ -295,6 +353,7 @@ module.exports = async (req, res) => {
       if (!S(b.class_name) || !(await q("SELECT 1 AS x FROM users WHERE id=$1 AND role IN ('staff','tutor')", [uid])).length) return send(res, 400, { e: 'Choose a person and enter the class.' });
       if (+b.id) await q(`UPDATE tutors SET user_id=$1,class_name=$2,year=$3,section=$4,since=$5,updated=${NOW},updated_by=$6 WHERE id=$7`, [uid, S(b.class_name), S(b.year), S(b.section), D(b.since), u.name, +b.id]);
       else await q(`INSERT INTO tutors(user_id,class_name,year,section,since,updated,updated_by) VALUES($1,$2,$3,$4,$5,${NOW},$6)`, [uid, S(b.class_name), S(b.year), S(b.section), D(b.since), u.name]);
+      await notify([uid], 'tt', 'Class tutor assignment', S(b.class_name) + ' ' + S(b.year), 'tt');
       return send(res, 200, { ok: 1 });
     }
     if (a === 'tutors.del') {
@@ -313,6 +372,7 @@ module.exports = async (req, res) => {
       const v = [uid, day, f, t2, S(b.subject), S(b.class_name), S(b.room), sh, u.name];
       if (id) await q(`UPDATE tt SET user_id=$1,day=$2,t_from=$3,t_to=$4,subject=$5,class_name=$6,room=$7,shift=$8,updated=${NOW},updated_by=$9 WHERE id=$10`, v.concat([id]));
       else await q(`INSERT INTO tt(user_id,day,t_from,t_to,subject,class_name,room,shift,updated,updated_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,${NOW},$9)`, v);
+      await notify([uid], 'tt', 'Your timetable was updated', S(b.subject) + ' · ' + S(b.class_name), 'tt');
       return send(res, 200, { ok: 1 });
     }
     if (a === 'tt.del') { if (!ADM) return deny(); await q('DELETE FROM tt WHERE id=$1', [+b.id]); return send(res, 200, { ok: 1 }); }
@@ -325,6 +385,10 @@ module.exports = async (req, res) => {
       if (a === 'notes.add') {
         if (!S(b.text)) return send(res, 400, { e: 'Write a note first.' });
         await q('INSERT INTO notes(ref,ref_id,user_id,body) VALUES($1,$2,$3,$4)', [ref, id, u.id, S(b.text)]);
+        const mine = u.id === o.user_id; let to;
+        if (ref === 'task') { const cr = (await q('SELECT t.created_by FROM assign a JOIN tasks t ON t.id=a.task_id WHERE a.id=$1', [id]))[0]; to = mine ? [cr && cr.created_by].filter(Boolean) : [o.user_id]; }
+        else to = mine ? await adminIds() : [o.user_id];
+        await notify(to.filter(x => x !== u.id), 'note', u.name + ' added a note', S(b.text).slice(0, 120), mine ? (ref === 'task' ? 'tasks' : 'tut') : (ref === 'task' ? 'mine' : 'tt'), id);
         return send(res, 200, { ok: 1 });
       }
       return send(res, 200, { notes: await q('SELECT n.body,n.created,u.name FROM notes n JOIN users u ON u.id=n.user_id WHERE n.ref=$1 AND n.ref_id=$2 ORDER BY n.id', [ref, id]) });
